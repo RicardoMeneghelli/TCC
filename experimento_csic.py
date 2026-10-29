@@ -74,6 +74,27 @@ def extrair_base(df):
     return np.array(linhas, dtype=float), np.array(caminhos)
 
 
+def chaves_grupo(df):
+    """Chave que identifica requisições gêmeas (mesmo caminho e mesma carga útil).
+    No CSIC 2010, cada GET com query é seguido de um POST equivalente; gêmeas devem
+    ficar do mesmo lado da divisão treino/teste, para não haver vazamento."""
+    chaves = []
+    for i, (url, cont) in enumerate(zip(df["URL"], df["content"].fillna(""))):
+        sp = urlsplit(str(url).rsplit(" HTTP/", 1)[0])
+        carga = sp.query if sp.query else str(cont)
+        chaves.append(f"{sp.path}?{carga}" if carga else f"linha{i}")
+    return np.array(chaves)
+
+
+def dividir_por_grupo(chaves, indices, rng):
+    """Sorteia metade dos grupos para o treino; devolve (treino, teste) entre 'indices'."""
+    uni = np.unique(chaves[indices])
+    rng.shuffle(uni)
+    no_treino = set(uni[: len(uni) // 2])
+    m = np.array([k in no_treino for k in chaves[indices]])
+    return indices[m], indices[~m]
+
+
 def montar(base, caminhos, idx_treino, idx_alvo):
     """Adiciona o atributo de raridade do caminho, calculado só com o conjunto de treino."""
     freq = Counter(caminhos[idx_treino])
@@ -110,6 +131,7 @@ def main(n_rep=30):
     t0 = time.perf_counter()
     df, y = carregar(CAMINHO)
     base, caminhos = extrair_base(df)
+    chaves = chaves_grupo(df)
     t_extr = time.perf_counter() - t0
     normais = np.where(y == 0)[0]
     anom = np.where(y == 1)[0]
@@ -133,18 +155,19 @@ def main(n_rep=30):
     # ---- Cenário B: treino só com tráfego normal; teste = normal inédito + todos os ataques
     cont_B = {"0,01": 0.01, "0,05": 0.05, "0,10": 0.10, "auto": "auto"}
     resB = {k: [] for k in cont_B}
+    n_tr, n_te = [], []
     for s in range(n_rep):
         rng = np.random.default_rng(100 + s)
-        perm = rng.permutation(normais)
-        treino, teste_n = perm[: len(perm) // 2], perm[len(perm) // 2:]
+        treino, teste_n = dividir_por_grupo(chaves, normais, rng)
+        n_tr.append(len(treino)); n_te.append(len(teste_n))
         idx_teste = np.concatenate([teste_n, anom])
         Xtr, Xte = montar(base, caminhos, treino, idx_teste)
         for nome, c in cont_B.items():
             pred, esc = treinar_auditoria_local(Xtr, Xte, c, s)
             resB[nome].append(metricas(y[idx_teste], pred, esc))
     out["B"] = {k: resumir(v) for k, v in resB.items()}
-    out["B_n_treino"] = int(len(normais) // 2)
-    out["B_n_teste_normal"] = int(len(normais) - len(normais) // 2)
+    out["B_n_treino"] = float(np.mean(n_tr))
+    out["B_n_teste_normal"] = float(np.mean(n_te))
 
     # ---- Cenário C: todo o dataset, sem rótulos, 41% de ataques (cont. = proporção real)
     resC = []
@@ -159,7 +182,7 @@ def main(n_rep=30):
 
     # ---- Tempo: extração + treino + predição no dataset completo (um cenário B típico)
     t1 = time.perf_counter()
-    Xtr, Xte = montar(base, caminhos, normais[: len(normais) // 2], idx)
+    Xtr, Xte = montar(base, caminhos, normais[: len(normais) // 2], idx)  # tempo de referência
     treinar_auditoria_local(Xtr, Xte, 0.05, 0)
     out["tempo_modelo_s"] = time.perf_counter() - t1
 
